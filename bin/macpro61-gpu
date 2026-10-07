@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+SYSFS_ROOT="${MACPRO61_SYSFS_ROOT:-/sys}"
+DRI_ROOT="${MACPRO61_DRI_ROOT:-/dev/dri}"
+PRODUCT_NAME_FILE="${MACPRO61_PRODUCT_NAME_FILE:-$SYSFS_ROOT/class/dmi/id/product_name}"
+STATE_DIR="${MACPRO61_STATE_DIR:-/var/lib/macpro61-dual-gpu}"
+TEST_LOG_DIR=''
+TEST_KEEP_LOGS=0
+TEST_PIDS=()
+
+info() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+product_name() {
+  if [[ -r "$PRODUCT_NAME_FILE" ]]; then
+    tr -d '\n' <"$PRODUCT_NAME_FILE"
+  else
+    printf 'unknown'
+  fi
+}
+
+is_macpro61() {
+  [[ "$(product_name)" == "MacPro6,1" ]]
+}
+
+apple_amd_gpus() {
+  local device vendor class subsystem_vendor
+
+  for device in "$SYSFS_ROOT"/bus/pci/devices/*; do
+    [[ -r "$device/vendor" && -r "$device/class" ]] || continue
+    vendor=$(<"$device/vendor")
+    class=$(<"$device/class")
+    if [[ -r "$device/subsystem_vendor" ]]; then
+      subsystem_vendor=$(<"$device/subsystem_vendor")
+    else
+      subsystem_vendor=''
+    fi
+
+    if [[ "$vendor" == "0x1002" && "$class" == 0x03* && "$subsystem_vendor" == "0x106b" ]]; then
+      basename "$device"
+    fi
+  done | sort
+}
+
+render_node_for() {
+  local pci=$1
+  local node="$DRI_ROOT/by-path/pci-$pci-render"
+  local sys_node
+
+  if [[ -e "$node" ]]; then
+    printf '%s' "$node"
+    return
+  fi
+
+  for sys_node in "$SYSFS_ROOT/bus/pci/devices/$pci"/drm/renderD*; do
+    [[ -e "$sys_node" ]] || continue
+    node="$DRI_ROOT/${sys_node##*/}"
+    if [[ -e "$node" ]]; then
+      printf '%s' "$node"
+      return
+    fi
+  done
+
+  return 0
+}
+
+driver_for() {
+  local pci=$1
+  local driver="$SYSFS_ROOT/bus/pci/devices/$pci/driver"
+
+  if [[ -L "$driver" ]]; then
+    basename "$(readlink -f "$driver")"
+  else
+    printf 'unbound'
+  fi
+}
+
+vram_for() {
+  local pci=$1
+  local file="$SYSFS_ROOT/bus/pci/devices/$pci/mem_info_vram_total"
+
+  if [[ -r "$file" ]]; then
+    if command -v numfmt >/dev/null 2>&1; then
+      numfmt --to=iec <"$file" | tr -d '\n'
+    else
+      printf '%s bytes' "$(<"$file")"
+    fi
+  else
+    printf 'unknown'
+  fi
+}
+
+temperature_for() {
+  local pci=$1
+  local sensor value
+
+  for sensor in "$SYSFS_ROOT/bus/pci/devices/$pci"/hwmon/hwmon*/temp1_input; do
+    [[ -r "$sensor" ]] || continue
+    value=$(<"$sensor")
+    printf '%dC' "$((value / 1000))"
+    return
+  done
+
+  printf 'unknown'
+}
+
+supergfx_state() {
+  local enabled active
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf 'systemd unavailable'
+    return
+  fi
+
+  enabled=$(systemctl is-enabled supergfxd.service 2>/dev/null || true)
+  active=$(systemctl is-active supergfxd.service 2>/dev/null || true)
+  printf '%s/%s' "${enabled:-not-found}" "${active:-inactive}"
+}
+
+show_status() {
+  local -a gpus=()
+  local pci render
+
+  mapfile -t gpus < <(apple_amd_gpus)
+
+  info "Model: $(product_name)"
+  info "supergfxd: $(supergfx_state)"
+  info "Apple AMD GPUs detected: ${#gpus[@]}"
+
+  for pci in "${gpus[@]}"; do
+    render=$(render_node_for "$pci")
+    info "  $pci driver=$(driver_for "$pci") render=${render:-missing} vram=$(vram_for "$pci") temp=$(temperature_for "$pci")"
+  done
+
+  if ((${#gpus[@]} < 2)); then
+    return 2
+  fi
+
+  for pci in "${gpus[@]}"; do
+    [[ "$(driver_for "$pci")" == "amdgpu" ]] || return 3
+    [[ -n "$(render_node_for "$pci")" ]] || return 4
+  done
+}
+
+require_root() {
+  local effective_uid=$EUID
+
+  if [[ "${MACPRO61_TEST_MODE:-0}" == "1" ]]; then
+    effective_uid=${MACPRO61_TEST_EUID:-$EUID}
+  fi
+  ((effective_uid == 0)) || die "this command must run as root"
+}
+
+prepare_privileged_environment() {
+  require_root
+
+  if [[ "${MACPRO61_TEST_MODE:-0}" != "1" ]] &&
+    [[ -n "${MACPRO61_SYSFS_ROOT+x}${MACPRO61_DRI_ROOT+x}${MACPRO61_PRODUCT_NAME_FILE+x}${MACPRO61_STATE_DIR+x}" ]]; then
+    die "MACPRO61_* path overrides are refused for privileged operations"
+  fi
+
+  if [[ "${MACPRO61_TEST_MODE:-0}" != "1" ]]; then
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH
+  fi
+}
+
+restore_service_state() {
+  local previous_enabled=$1 previous_active=$2 remove_mask=$3
+
+  if ((remove_mask)); then
+    systemctl unmask supergfxd.service >/dev/null 2>&1 || true
+    rm -f "$STATE_DIR/supergfxd-mask-created"
+  fi
+  [[ "$previous_enabled" == "enabled" ]] && systemctl enable supergfxd.service >/dev/null 2>&1 || true
+  [[ "$previous_active" == "active" ]] && systemctl start supergfxd.service >/dev/null 2>&1 || true
+}
+
+fix_gpus() {
+  local dry_run=0 force=0 arg previous_enabled previous_active mask_was_created=0
+
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+      --force) force=1 ;;
+      *) die "unknown fix option: $arg" ;;
+    esac
+  done
+
+  if ! is_macpro61 && ((force == 0)); then
+    die "$(product_name) is not MacPro6,1; use --force only if you have verified the hardware"
+  fi
+
+  if ((dry_run)); then
+    info "Would stop, disable, and mask supergfxd.service."
+    info "Would rescan the PCI bus through $SYSFS_ROOT/bus/pci/rescan."
+    info "Would verify two Apple AMD GPUs using amdgpu with render nodes."
+    return
+  fi
+
+  prepare_privileged_environment
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required to disable supergfxd"
+  [[ -w "$SYSFS_ROOT/bus/pci/rescan" ]] || die "PCI rescan interface is unavailable"
+
+  previous_enabled=$(systemctl is-enabled supergfxd.service 2>/dev/null || true)
+  previous_active=$(systemctl is-active supergfxd.service 2>/dev/null || true)
+
+  if systemctl cat supergfxd.service >/dev/null 2>&1; then
+    info "Stopping and disabling supergfxd.service..."
+    systemctl disable --now supergfxd.service
+  else
+    info "supergfxd.service is not installed."
+  fi
+
+  if [[ "$previous_enabled" != "masked" ]]; then
+    info "Masking supergfxd.service to prevent future GPU removal..."
+    if ! systemctl mask supergfxd.service; then
+      restore_service_state "$previous_enabled" "$previous_active" 0
+      die "could not mask supergfxd.service; its previous state was restored"
+    fi
+    mask_was_created=1
+
+    if ! mkdir -p "$STATE_DIR" || ! printf 'created by macpro61-gpu %s\n' "$VERSION" >"$STATE_DIR/supergfxd-mask-created"; then
+      restore_service_state "$previous_enabled" "$previous_active" 1
+      die "could not record ownership of the supergfxd service mask"
+    fi
+  else
+    info "supergfxd.service is already masked."
+  fi
+
+  info "Rescanning the PCI bus..."
+  if ! printf '1' >"$SYSFS_ROOT/bus/pci/rescan"; then
+    restore_service_state "$previous_enabled" "$previous_active" "$mask_was_created"
+    die "PCI rescan failed; the previous supergfxd state was restored"
+  fi
+  command -v udevadm >/dev/null 2>&1 && udevadm settle
+  sleep 1
+
+  info
+  if show_status; then
+    info "Both Mac Pro GPUs are available."
+  else
+    die "the fix was applied, but two usable GPUs were not detected; reboot once and run 'macpro61-gpu status'"
+  fi
+}
+
+restore_supergfxd() {
+  local force=0
+
+  while (($#)); do
+    case "$1" in
+      --force) force=1 ;;
+      *) die "unknown restore-supergfxd option: $1" ;;
+    esac
+    shift
+  done
+
+  if ! is_macpro61 && ((force == 0)); then
+    die "$(product_name) is not MacPro6,1; use --force only if you have verified the hardware"
+  fi
+
+  prepare_privileged_environment
+  command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
+
+  if [[ ! -f "$STATE_DIR/supergfxd-mask-created" && $force -eq 0 ]]; then
+    die "this utility did not create the existing mask; use --force to unmask it explicitly"
+  fi
+
+  systemctl unmask supergfxd.service
+  rm -f "$STATE_DIR/supergfxd-mask-created"
+  warn "supergfxd was unmasked but not enabled; Integrated mode can remove one Mac Pro GPU again"
+}
+
+show_devices() {
+  local -a gpus=()
+  local pci render
+
+  mapfile -t gpus < <(apple_amd_gpus)
+  ((${#gpus[@]} >= 2)) || die "two Apple AMD GPUs are not available"
+
+  for pci in "${gpus[@]}"; do
+    render=$(render_node_for "$pci")
+    [[ -n "$render" ]] || die "render node missing for $pci"
+    printf '%s\n' "$render"
+  done
+}
+
+show_test_summary() {
+  local log=$1
+  local result
+
+  result=$(grep -E 'frame=.*Lsize|bench: utime' "$log" | tail -n 2 || true)
+  [[ -n "$result" ]] && printf '%s\n' "$result"
+}
+
+run_encode() {
+  local render=$1 frames=$2 log=$3
+
+  ffmpeg -hide_banner -loglevel info -benchmark \
+    -init_hw_device "vaapi=gpu:$render" -filter_hw_device gpu \
+    -f lavfi -i testsrc2=size=1920x1080:rate=60 \
+    -vf 'format=nv12,hwupload' -frames:v "$frames" \
+    -c:v h264_vaapi -f null - >"$log" 2>&1
+}
+
+cleanup_gpu_test() {
+  local pid
+
+  for pid in "${TEST_PIDS[@]}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+  TEST_PIDS=()
+
+  if [[ -n "$TEST_LOG_DIR" && $TEST_KEEP_LOGS -eq 0 ]]; then
+    rm -rf "$TEST_LOG_DIR"
+  fi
+}
+
+interrupt_gpu_test() {
+  cleanup_gpu_test
+  exit 130
+}
+
+test_gpus() {
+  local frames=300
+  local -a gpus=() renders=() pids=() statuses=(0 0)
+  local arg pci render index log_dir selector result
+
+  while (($#)); do
+    arg=$1
+    shift
+    case "$arg" in
+      --frames)
+        (($#)) || die "--frames requires a value"
+        frames=$1
+        shift
+        [[ "$frames" =~ ^[1-9][0-9]*$ ]] || die "frames must be a positive integer"
+        ;;
+      *) die "unknown test option: $arg" ;;
+    esac
+  done
+
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required"
+  mapfile -t gpus < <(apple_amd_gpus)
+  ((${#gpus[@]} >= 2)) || die "two Apple AMD GPUs are not available"
+
+  for pci in "${gpus[@]:0:2}"; do
+    render=$(render_node_for "$pci")
+    [[ -n "$render" ]] || die "render node missing for $pci"
+    renders+=("$render")
+  done
+
+  log_dir=$(mktemp -d "${TMPDIR:-/tmp}/macpro61-gpu-test.XXXXXX")
+  TEST_LOG_DIR=$log_dir
+  trap cleanup_gpu_test EXIT
+  trap interrupt_gpu_test INT TERM HUP
+
+  info "Testing each GPU independently with a 1080p60 H.264 VA-API encode..."
+  for index in 0 1; do
+    pci=${gpus[$index]}
+    if run_encode "${renders[$index]}" "$frames" "$log_dir/single-$index.log"; then
+      info "PASS $pci"
+      show_test_summary "$log_dir/single-$index.log"
+    else
+      show_test_summary "$log_dir/single-$index.log"
+      TEST_KEEP_LOGS=1
+      die "independent encode failed on $pci; log: $log_dir/single-$index.log"
+    fi
+  done
+
+  info
+  info "Testing both GPUs concurrently..."
+  for index in 0 1; do
+    run_encode "${renders[$index]}" "$frames" "$log_dir/dual-$index.log" &
+    pids+=("$!")
+    TEST_PIDS+=("$!")
+  done
+
+  for index in 0 1; do
+    wait "${pids[$index]}" || statuses[$index]=$?
+    if [[ ${statuses[$index]} -eq 0 ]]; then
+      result=PASS
+    else
+      result=FAIL
+    fi
+    info "$result ${gpus[$index]}"
+    show_test_summary "$log_dir/dual-$index.log"
+  done
+  TEST_PIDS=()
+
+  if [[ ${statuses[0]} -ne 0 || ${statuses[1]} -ne 0 ]]; then
+    TEST_KEEP_LOGS=1
+    die "concurrent GPU test failed; logs: $log_dir"
+  fi
+
+  if command -v vainfo >/dev/null 2>&1; then
+    info
+    info "VA-API device checks:"
+    for index in 0 1; do
+      if vainfo --display drm --device "${renders[$index]}" >/dev/null 2>&1; then
+        info "PASS ${gpus[$index]} VA-API"
+      else
+        warn "${gpus[$index]} failed vainfo"
+      fi
+    done
+  fi
+
+  if command -v vulkaninfo >/dev/null 2>&1; then
+    info
+    info "Vulkan device checks:"
+    for index in 0 1; do
+      selector=${gpus[$index]//[:.]/_}
+      if DRI_PRIME="pci-$selector!" vulkaninfo --summary >/dev/null 2>&1; then
+        info "PASS ${gpus[$index]} Vulkan"
+      else
+        warn "${gpus[$index]} failed vulkaninfo"
+      fi
+    done
+  fi
+
+  info
+  info "Both GPUs passed independent and concurrent tests."
+  cleanup_gpu_test
+  trap - EXIT INT TERM HUP
+}
+
+require_no_args() {
+  local command=$1
+  shift
+  (($# == 0)) || die "$command does not accept arguments"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: macpro61-gpu COMMAND [OPTIONS]
+
+Commands:
+  status                       Show both Apple AMD GPUs and supergfxd state
+  devices                      Print usable internal GPU render nodes
+  fix [--dry-run] [--force]    Disable supergfxd, rescan PCI, and verify GPUs
+  test [--frames N]            Test each GPU alone and both concurrently
+  restore-supergfxd [--force]  Remove a service mask without enabling it
+  version                      Print the utility version
+  help                         Show this help
+
+The fix command intentionally does not uninstall distribution packages.
+EOF
+}
+
+main() {
+  local command=${1:-help}
+  (($# == 0)) || shift
+
+  case "$command" in
+    status) require_no_args status "$@"; show_status ;;
+    devices) require_no_args devices "$@"; show_devices ;;
+    fix) fix_gpus "$@" ;;
+    test) test_gpus "$@" ;;
+    restore-supergfxd) restore_supergfxd "$@" ;;
+    version|--version|-v) require_no_args version "$@"; info "$VERSION" ;;
+    help|--help|-h) require_no_args help "$@"; usage ;;
+    *) usage >&2; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

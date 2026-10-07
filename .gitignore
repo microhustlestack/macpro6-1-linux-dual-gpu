@@ -1,0 +1,5 @@
+*.log
+*.mp4
+*.mkv
+*.mov
+dist/
