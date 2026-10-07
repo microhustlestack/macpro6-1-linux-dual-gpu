@@ -1,5 +1,7 @@
 # MacPro6,1 Linux Dual GPU
 
+![MacPro6,1 Omarchy Linux Dual GPU](assets/macpro-omarchy-linux-dual-gpu-hero.png)
+
 Restore, verify, and use both AMD FirePro GPUs in the cylindrical 2013 Mac Pro on Linux.
 
 The Mac Pro (Late 2013) always shipped with two AMD GPUs: dual FirePro D300, D500, or D700 cards. Some Linux installations add `supergfxctl`, a graphics-switching utility intended for laptops with an integrated GPU and a discrete GPU. On the Mac Pro, it can mistake one FirePro for a switchable dGPU and remove it from PCI when configured in `Integrated` mode.
