@@ -90,6 +90,20 @@ The initial release was validated on a MacPro6,1 with dual FirePro D500 GPUs, Li
 
 Concurrent aggregate encode throughput was approximately 169 fps. No GPU faults, resets, hangs, or PCIe errors were logged.
 
+### D300 report
+
+Validated on a second MacPro6,1 with dual FirePro D300 GPUs (`1002:679E`, Apple subsystem `106B:0126`), Linux 7.2.5-omarchy, Mesa 26.2.2, and the `amdgpu` driver, running the same 300-frame 1080p60 test:
+
+| Test | GPU at `02:00.0` | GPU at `06:00.0` |
+|---|---:|---:|
+| Independent 1080p60 H.264 encode | ~12 fps | ~79 fps |
+| Concurrent 1080p60 H.264 encode | ~12 fps | ~85 fps |
+| Vulkan rendering | Not checked | Not checked |
+| VRAM | 3 GiB | 3 GiB |
+| Temperature after test | 55 C | 59 C |
+
+Both cards passed every encode test with no faults, resets, hangs, or PCIe errors. On this unit the `02:00.0` VCE engine sustained a fixed low rate of roughly 12 fps regardless of resolution or test pattern, while `06:00.0` matched the D500 throughput; the cause appears to be an unresolved VCE clock cap on that card, and D300 owners should expect per-card variance. `vainfo` and `vulkaninfo` were not installed on this system, so VA-API capability and Vulkan were not exercised.
+
 Performance varies with CPU speed, source decoding, cooling, Mesa, kernel, and GPU model.
 
 ## Use Both GPUs
@@ -145,7 +159,7 @@ The hardware detection covers all Apple GPU options for `MacPro6,1` without rely
 - Dual FirePro D500 with 3 GiB each
 - Dual FirePro D700 with 6 GiB each
 
-The D500 configuration has been tested directly. Reports and patches for D300 and D700 systems are welcome.
+The D300 and D500 configurations have been tested directly. Reports and patches for D700 systems are welcome.
 
 ## References
 
