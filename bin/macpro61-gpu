@@ -185,8 +185,12 @@ restore_service_state() {
     systemctl unmask supergfxd.service >/dev/null 2>&1 || true
     rm -f "$STATE_DIR/supergfxd-mask-created"
   fi
-  [[ "$previous_enabled" == "enabled" ]] && systemctl enable supergfxd.service >/dev/null 2>&1 || true
-  [[ "$previous_active" == "active" ]] && systemctl start supergfxd.service >/dev/null 2>&1 || true
+  if [[ "$previous_enabled" == "enabled" ]]; then
+    systemctl enable supergfxd.service >/dev/null 2>&1 || true
+  fi
+  if [[ "$previous_active" == "active" ]]; then
+    systemctl start supergfxd.service >/dev/null 2>&1 || true
+  fi
 }
 
 fix_gpus() {
@@ -391,7 +395,7 @@ test_gpus() {
   done
 
   for index in 0 1; do
-    wait "${pids[$index]}" || statuses[$index]=$?
+    wait "${pids[$index]}" || statuses[index]=$?
     if [[ ${statuses[$index]} -eq 0 ]]; then
       result=PASS
     else
